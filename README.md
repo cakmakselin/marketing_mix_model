@@ -1,12 +1,9 @@
 # Marketing Mix Model (MMM)
 
-This project builds statistical models that show you which marketing channels actually drive sales. It accounts for carryover effects (a TV ad today might still influence purchases next week).
-
 The system can:
 - Analyze marketing performance across 6 channels (TV, radio, social media, search, outdoor, print)
 - Use either linear regression or Bayesian modeling 
 - Serve predictions via a REST API with CSV file uploads
-- Calculate marketing attribution and ROI
 
 ## Quick Start
 
