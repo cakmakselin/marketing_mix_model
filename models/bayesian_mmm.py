@@ -50,6 +50,10 @@ class BayesianMMMModel(BaseMMMModel):
         print(f"Bayesian sampling complete ({draws} draws)")
     
     def predict(self, data):
+        #check if model is trained
+        if not self.is_trained or self.alpha_mean is None or self.betas_mean is None:
+            raise AttributeError("Model must be trained before making predictions")
+        
         #dynamically derive spend columns from data
         spend_cols = [col for col in data.columns if col.endswith('_spend')]
         
