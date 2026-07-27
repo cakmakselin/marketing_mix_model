@@ -1,15 +1,12 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 import pandas as pd
 from pathlib import Path
 from typing import List, Optional, Dict, Union
-from datetime import date
 import sys
 import tempfile
-import os
-import io
 
-#add project root for imports
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -17,12 +14,29 @@ from config import config
 from services.mmm_service import MMMService
 from data.ingestion import DataIngestor
 
-app = FastAPI(title="Marketing Mix Model API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print(f"Loading pre-trained {config.default_model_type} model with adstock_decay={config.adstock_decay:.3f}")
+    mmm_service.load_pretrained()
+    yield
 
-#initialize MMM service with pre-trained model
-print(f"Loading pre-trained {config.default_model_type} model with adstock_decay={config.adstock_decay:.3f}")
+
+app = FastAPI(title="Marketing Mix Model API", version="1.0.0", lifespan=lifespan)
+
 mmm_service = MMMService(model_type=config.default_model_type, adstock_decay=config.adstock_decay)
-mmm_service.load_pretrained()
+
+@app.get("/")
+def root():
+    # root endpoint with API information
+    return {
+        "title": "Marketing Mix Model API",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health (GET) - health check and service status",
+            "predictions": "/predictions (POST) - get predictions from CSV files",
+            "docs": "/docs - interactive API documentation"
+        }
+    }
 
 class PredictionResponse(BaseModel):
     #sales prediction response

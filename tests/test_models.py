@@ -86,7 +86,7 @@ class TestLinearMMMModel:
         model = LinearMMMModel()
         df, _ = sample_training_data
         
-        with pytest.raises(AttributeError):
+        with pytest.raises(RuntimeError, match="must be trained"):
             model.predict(df)
     
     def test_predict_after_training(self, sample_training_data):
@@ -105,6 +105,22 @@ class TestBayesianMMMModel:
         assert model.adstock_decay == 0.5
         assert not model.is_trained
         assert model.trace is None
+
+    def test_save_and_load_metadata(self, tmp_path, sample_training_data):
+        model = LinearMMMModel(adstock_decay=0.3)
+        df, spend_cols = sample_training_data
+        model.train(df, 'sales', spend_cols)
+
+        filepath = tmp_path / 'linear_model.pkl'
+        model.save(str(filepath))
+
+        loaded_model = LinearMMMModel(adstock_decay=0.1)
+        loaded_model.load(str(filepath))
+
+        assert loaded_model.is_trained
+        assert loaded_model.adstock_decay == 0.3
+        assert loaded_model.feature_cols == model.feature_cols
+        assert loaded_model.spend_cols == model.spend_cols
     
     @patch('pymc.sample') 
     def test_train_basic(self, mock_sample, sample_training_data):
@@ -128,7 +144,7 @@ class TestBayesianMMMModel:
         model = BayesianMMMModel()
         df, _ = sample_training_data
         
-        with pytest.raises(AttributeError):
+        with pytest.raises(RuntimeError, match="must be trained"):
             model.predict(df)
     
     @patch('pymc.sample')
