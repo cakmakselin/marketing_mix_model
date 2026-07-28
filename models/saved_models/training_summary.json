@@ -1,0 +1,71 @@
+{
+  "trained_at": "2026-07-27T15:33:17",
+  "adstock_decay": 0.3,
+  "spend_cols": [
+    "outdoor_spend",
+    "print_spend",
+    "radio_spend",
+    "search_spend",
+    "social_media_spend",
+    "tv_spend"
+  ],
+  "train_period": [
+    "2022-01-01",
+    "2022-12-31"
+  ],
+  "cleaning_thresholds": {
+    "outdoor_spend": 363129.9999999999,
+    "print_spend": 232520.99999999994,
+    "radio_spend": 201024.99999999988,
+    "search_spend": 106035.0,
+    "social_media_spend": 86348.0,
+    "tv_spend": 511901.9999999999,
+    "sales": 4736174.0
+  },
+  "holdout": {
+    "linear": {
+      "mape": 7.158,
+      "r2": 0.581
+    },
+    "bayesian": {
+      "mape": 7.29,
+      "r2": 0.565
+    }
+  },
+  "channel_contributions": {
+    "linear": {
+      "outdoor_spend": 4894841.0,
+      "print_spend": 286484.0,
+      "radio_spend": 2861395.0,
+      "search_spend": 7047314.0,
+      "social_media_spend": -5725797.0,
+      "tv_spend": 7489114.0
+    },
+    "bayesian": {
+      "outdoor_spend": 4932458.0,
+      "print_spend": 397588.0,
+      "radio_spend": 2889392.0,
+      "search_spend": 12988957.0,
+      "social_media_spend": 4482235.0,
+      "tv_spend": 7522423.0
+    }
+  },
+  "channel_roi": {
+    "linear": {
+      "outdoor_spend": 2.28,
+      "print_spend": 0.5,
+      "radio_spend": 3.08,
+      "search_spend": 5.0,
+      "social_media_spend": -5.03,
+      "tv_spend": 2.45
+    },
+    "bayesian": {
+      "outdoor_spend": 2.3,
+      "print_spend": 0.69,
+      "radio_spend": 3.11,
+      "search_spend": 9.21,
+      "social_media_spend": 3.94,
+      "tv_spend": 2.46
+    }
+  }
+}

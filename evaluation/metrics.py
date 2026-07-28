@@ -7,10 +7,10 @@ def calculate_mape(actual: pd.Series, predicted: pd.Series) -> float:
     if len(actual) != len(predicted):
         raise ValueError("Series must have same length")
     
-    #avoid division by zero for very small values
-    mask = np.abs(actual) > 1000
+    #exclude zero actuals to avoid division by zero
+    mask = np.asarray(actual) != 0
     if not mask.any():
-        return 100.0  #return high error if all values too small
+        raise ValueError("MAPE undefined: all actual values are zero")
     
     actual_filtered = actual[mask]
     predicted_filtered = predicted[mask]

@@ -1,56 +1,35 @@
-import pandas as pd
+import json
+from pathlib import Path
+
 import numpy as np
-import sys
-import types
-
-try:
-    import pymc as pm
-    import arviz as az
-except ImportError:
-    class _SimpleTrace:
-        def __init__(self, alpha_mean, betas_mean):
-            self.posterior = {
-                'alpha': types.SimpleNamespace(mean=lambda: types.SimpleNamespace(values=alpha_mean)),
-                'betas': types.SimpleNamespace(mean=lambda dim=None: types.SimpleNamespace(values=betas_mean))
-            }
-
-        def to_netcdf(self, filepath):
-            return None
-
-    class _ModelContext:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    class _StubMath:
-        @staticmethod
-        def dot(x, betas):
-            return np.dot(x, betas)
-
-    class _StubPyMC(types.ModuleType):
-        def __init__(self):
-            super().__init__('pymc')
-            self.math = _StubMath()
-
-        def Model(self, *args, **kwargs):
-            return _ModelContext()
-
-        def Normal(self, *args, **kwargs):
-            return 0
-
-        def HalfNormal(self, *args, **kwargs):
-            return 1
-
-        def sample(self, *args, **kwargs):
-            return _SimpleTrace(0, np.zeros(1))
-
-    pm = _StubPyMC()
-    sys.modules['pymc'] = pm
-    az = None
+import pandas as pd
 
 from .base_model import BaseMMMModel
+
+
+def _import_pymc():
+    #lazy import so the linear model works without PyMC installed,
+    #but a broken/missing PyMC fails loudly instead of silently faking results
+    try:
+        import pymc as pm
+        return pm
+    except ImportError as exc:
+        raise ImportError(
+            "PyMC is required for BayesianMMMModel but could not be imported. "
+            "Install a compatible environment (Python >= 3.10, see requirements.txt). "
+            f"Original error: {exc}"
+        ) from exc
+
+
+def _import_arviz():
+    try:
+        import arviz as az
+        return az
+    except ImportError as exc:
+        raise ImportError(
+            "ArviZ is required to save/load Bayesian traces. "
+            f"Original error: {exc}"
+        ) from exc
 
 
 class BayesianMMMModel(BaseMMMModel):
@@ -59,95 +38,143 @@ class BayesianMMMModel(BaseMMMModel):
         self.trace = None
         self.alpha_mean = None
         self.betas_mean = None
-        self.feature_cols = []
-        self.spend_cols = []
+        #feature standardization parameters, fixed at training time
+        self.feature_means = None
+        self.feature_stds = None
+
+    def _standardize(self, X):
+        return (X - self.feature_means) / self.feature_stds
 
     def train(self, df, sales_col, spend_cols, draws=500):
-        if pm is None:
-            raise ImportError("PyMC is required for BayesianMMMModel")
+        pm = _import_pymc()
 
-        # add transformed features
-        df_features = self.add_features(df, spend_cols)
+        X_df = self.build_features(df, spend_cols)
+        self.feature_cols = list(X_df.columns)
+        self.spend_cols = list(spend_cols)
 
-        # prepare training data
-        self.feature_cols = [col for col in df_features.columns
-                           if col != sales_col and col != 'date' and
-                           any(s in col for s in spend_cols)]
+        #standardize features so priors are on a common, known scale
+        self.feature_means = X_df.mean().values
+        self.feature_stds = X_df.std().replace(0, 1.0).values
+        X = self._standardize(X_df.values)
+        y = df[sales_col].values
 
-        X = df_features[self.feature_cols].values
-        y = df_features[sales_col].values
-
-        # bayesian linear regression
-        with pm.Model() as model:
+        n_spend = len(spend_cols)
+        with pm.Model():
             alpha = pm.Normal('alpha', mu=y.mean(), sigma=y.std())
-            betas = pm.Normal('betas', mu=0, sigma=1, shape=len(self.feature_cols))
+            #spend effects constrained positive: marketing should not reduce sales
+            betas_spend = pm.HalfNormal('betas_spend', sigma=y.std(), shape=n_spend)
+            #seasonal effects can go either way
+            betas_season = pm.Normal('betas_season', mu=0, sigma=y.std(),
+                                     shape=len(self.feature_cols) - n_spend)
             sigma = pm.HalfNormal('sigma', sigma=y.std())
 
+            betas = pm.math.concatenate([betas_spend, betas_season])
             mu = alpha + pm.math.dot(X, betas)
             pm.Normal('y', mu=mu, sigma=sigma, observed=y)
 
-            # sample posterior
             self.trace = pm.sample(
                 draws=draws,
                 tune=1000,
                 chains=2,
                 return_inferencedata=True,
-                target_accept=0.85
+                target_accept=0.9,
+                progressbar=False,
             )
 
-        # store posterior means for fast prediction
-        self.alpha_mean = self.trace.posterior['alpha'].mean().values
-        self.betas_mean = self.trace.posterior['betas'].mean(dim=['chain', 'draw']).values
+        #report convergence instead of assuming it
+        az = _import_arviz()
+        summary = az.summary(self.trace, var_names=['alpha', 'betas_spend', 'betas_season', 'sigma'])
+        divergences = int(self.trace.sample_stats['diverging'].values.sum())
+        max_rhat = float(summary['r_hat'].max())
+        print(f"Sampling done: {draws} draws | divergences={divergences} | max r_hat={max_rhat:.3f}")
+        if divergences > 0 or max_rhat > 1.05:
+            print("WARNING: sampling diagnostics look problematic; treat estimates with caution")
 
-        self.spend_cols = spend_cols
+        self.alpha_mean = float(self.trace.posterior['alpha'].mean().values)
+        self.betas_mean = self._posterior_betas().mean(axis=0)
         self.is_trained = True
-        print(f"Bayesian sampling complete ({draws} draws)")
+
+    def _posterior_betas(self):
+        #stack spend and season betas into draws x features, matching feature_cols order
+        post = self.trace.posterior
+        spend = post['betas_spend'].values.reshape(-1, post['betas_spend'].shape[-1])
+        season = post['betas_season'].values.reshape(-1, post['betas_season'].shape[-1])
+        return np.concatenate([spend, season], axis=1)
+
+    def _design_matrix(self, data):
+        X_df = self.build_features(data, self.spend_cols)[self.feature_cols]
+        return self._standardize(X_df.values)
 
     def predict(self, data):
         if not self.is_trained or self.alpha_mean is None or self.betas_mean is None:
             raise RuntimeError("Model must be trained before prediction")
+        X = self._design_matrix(data)
+        return self.alpha_mean + np.dot(X, self.betas_mean)
 
-        # dynamically derive spend columns from data
-        spend_cols = [col for col in data.columns if col.endswith('_spend')]
+    def raw_coefficients(self):
+        #posterior mean coefficients converted back from the standardized scale
+        coefs = self.betas_mean / self.feature_stds
+        intercept = self.alpha_mean - float(np.sum(self.betas_mean * self.feature_means / self.feature_stds))
+        return intercept, coefs
 
-        # make predictions using posterior means
-        df_features = self.add_features(data, spend_cols)
-        feature_cols = self.feature_cols if self.feature_cols else [col for col in df_features.columns
-                       if col not in ['sales', 'date'] and
-                       any(s in col for s in spend_cols)]
-        X_new = df_features[feature_cols].values
-        predictions = self.alpha_mean + np.dot(X_new, self.betas_mean)
-        return predictions
+    def predict_interval(self, data, hdi_prob=0.9):
+        #credible interval of expected sales from posterior draws (needs the trace)
+        if self.trace is None:
+            return None
+        X = self._design_matrix(data)
+        alpha_draws = self.trace.posterior['alpha'].values.reshape(-1)
+        betas_draws = self._posterior_betas()
+        #np.dot instead of `@`: the matmul operator triggers spurious FP
+        #warnings on macOS Accelerate BLAS builds
+        preds = alpha_draws[None, :] + np.dot(X, betas_draws.T)  # (rows, draws)
+        lo = (1 - hdi_prob) / 2 * 100
+        return np.percentile(preds, [lo, 100 - lo], axis=1)
 
-    def save_trace(self, filepath):
-        # save trace for later use
+    def save(self, trace_path):
+        #trace (netcdf) for uncertainty + json sidecar with everything
+        #needed to rebuild features and predict
         if self.trace is not None:
-            self.trace.to_netcdf(filepath)
+            self.trace.to_netcdf(str(trace_path))
+        meta = {
+            "adstock_decay": self.adstock_decay,
+            "feature_cols": self.feature_cols,
+            "spend_cols": self.spend_cols,
+            "feature_means": np.asarray(self.feature_means).tolist(),
+            "feature_stds": np.asarray(self.feature_stds).tolist(),
+            "alpha_mean": self.alpha_mean,
+            "betas_mean": np.asarray(self.betas_mean).tolist(),
+        }
+        with open(self._meta_path(trace_path), 'w') as f:
+            json.dump(meta, f, indent=2)
 
-    def load_trace(self, filepath):
-        # load saved trace
-        if az is None:
-            print("ArviZ is not available; skipping saved trace load")
+    def load(self, trace_path):
+        meta_path = self._meta_path(trace_path)
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"Model metadata not found: {meta_path}. Retrain with scripts/train_models.py"
+            )
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        self.adstock_decay = meta["adstock_decay"]
+        self.feature_cols = meta["feature_cols"]
+        self.spend_cols = meta["spend_cols"]
+        self.feature_means = np.array(meta["feature_means"])
+        self.feature_stds = np.array(meta["feature_stds"])
+        self.alpha_mean = meta["alpha_mean"]
+        self.betas_mean = np.array(meta["betas_mean"])
+        self.is_trained = True
+
+        #trace is optional: predictions work from posterior means alone,
+        #the trace only adds credible intervals
+        trace_path = Path(trace_path)
+        if trace_path.exists():
+            az = _import_arviz()
+            self.trace = az.from_netcdf(str(trace_path))
+        else:
             self.trace = None
-            self.alpha_mean = None
-            self.betas_mean = None
-            self.is_trained = False
-            return False
+        return True
 
-        try:
-            self.trace = az.from_netcdf(filepath)
-        except Exception as exc:
-            print(f"Failed to load saved trace: {exc}")
-            self.trace = None
-            self.alpha_mean = None
-            self.betas_mean = None
-            self.is_trained = False
-            return False
-
-        if self.trace is not None:
-            self.alpha_mean = self.trace.posterior['alpha'].mean().values
-            self.betas_mean = self.trace.posterior['betas'].mean(dim=['chain', 'draw']).values
-            self.is_trained = True
-            return True
-
-        return False
+    @staticmethod
+    def _meta_path(trace_path):
+        return Path(trace_path).with_suffix('.json')

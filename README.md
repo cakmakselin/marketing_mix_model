@@ -8,7 +8,7 @@ The system can:
 ## Quick Start
 
 ### Prerequisites
-- Python 3.9+ (I used 3.9.13)
+- Python 3.10+
 - A virtual environment
 
 ### Setup Instructions
@@ -85,7 +85,7 @@ marketing_mix_model/
 - **BayesianMMMModel**: More sophisticated PyMC model with Arviz trace storage
 
 **Evaluation** (`evaluation/`)
-- Uses MAPE (Mean Absolute Percentage Error) to evaluate model performance on validation data
+- MAPE and R² on a temporal holdout during training; the same metrics are computed for any upload that includes `sales_data.csv`
 
 **Service Layer** (`services/`)
 - **MMMService**: Main business logic that handles training, model loading, and prediction workflows
@@ -106,33 +106,35 @@ The API accepts multiple CSV files (one per marketing channel) via the `/predict
 - Each file needs a `date` column and either `spend` or `sales` column
 - Date format: YYYY-MM-DD
 - File naming: `{channel}_spend.csv` or `sales_data.csv`
+- All channels the model was trained on must be present (a clear error is returned otherwise)
 
 **Example Request:**
 Upload files like:
 - `tv_spend.csv`
 - `radio_spend.csv` 
 - `social_media_spend.csv`
-- `sales_data.csv` (optional - for evaluation)
+- ... (all trained channels)
+- `sales_data.csv` (optional - adds MAPE/R² evaluation to the response)
 
 **Response Format:**
 ```json
 {
   "forecast": [
-    {"date": "2024-01-01", "predicted_sales": 195000.5},
-    {"date": "2024-01-02", "predicted_sales": 198500.2}
+    {"date": "2022-01-01", "predicted_sales": 206831.9, "lower_90": 203222.1, "upper_90": 210851.3}
   ],
   "model_type": "bayesian",
   "adstock_decay": 0.3,
   "rows_processed": 365,
-  "evaluation": {"mape": 10.8}  
+  "evaluation": {"mape": 7.1, "r2": 0.78}
 }
 ```
+`lower_90`/`upper_90` credible intervals are included when the Bayesian model is serving with its trace loaded.
 
 ### Available Endpoints
 
-- `GET /health` - Service health check
-- `POST /predictions` - Upload CSV files for batch predictions
-- `GET /models` - Get current model information
+- `GET /health` - Service health check (`degraded` if no model could be loaded)
+- `POST /predictions` - Upload CSV files for batch predictions (503 if no model loaded)
+- `GET /models` - Model info plus training results: holdout metrics, channel contributions, ROI
 
 ## Technical Approach & Design Decisions
 
@@ -160,6 +162,11 @@ This visualization problem demonstrates the need for outlier removal. Under the 
 - Handled existing missing values throughout the dataset
 All flagged values were replaced with NaN and linearly interpolated to keep the time series intact for modeling. Linear interpolation was chosen because it's simple and doesn't introduce artificial patterns that could mess with the analysis.
 
+The outlier thresholds are *fit on training data* and saved with the model
+(`models/saved_models/training_summary.json`), then re-applied to prediction
+uploads. This keeps cleaning consistent between training and serving instead of
+re-deriving quantiles from whatever data happens to be uploaded.
+
 **Validation (Post-Cleaning Correlations)**
 After implementing preprocessing rules, meaningful patterns emerged. TV spend showed strongest sales correlation (0.50), followed by outdoor (0.37) and radio (0.21).
 
@@ -171,36 +178,63 @@ After implementing preprocessing rules, meaningful patterns emerged. TV spend sh
 
 ### Models Architecture (`models/`)
 
-**Feature engineering decisions**: Applied adstock transformation to spend columns to model decaying marketing effects. This made sense for the data as well since spend channels showed patterns like 50% zero-spend days, then bursts. Sales data doesn't have carryover effects, so no adstock there.
+**Feature engineering decisions**: Each channel gets exactly one feature:
+`log1p(adstock(spend))`. Adstock models the decaying carryover of marketing
+effects (spend channels show bursts with ~50-90% zero-spend days), and the log
+captures diminishing returns. Features are *only* derived from spend columns so the target (sales) can't leak. On top of
+the spend features there's a seasonal baseline (annual sin/cos wave) so channel
+coefficients don't absorb seasonality; monthly sales swing between ~134k and
+~226k in this data, and without a baseline that variation gets wrongly
+attributed to spend. A separate trend term was deliberately left out: with a
+single year of data, trend and annual seasonality are not separately
+identifiable (tested and a trend term destroyed out-of-sample accuracy).
 
-Log transforms addressed multiple issues I found: 
-- extreme scale differences 
-- diminishing returns modeling (higher spending should have proportionally less impact) 
-- better performance for Bayesian sampling which works better with smaller-scale values
+**Evaluation**: models are evaluated on a temporal holdout (train on the first
+80% of days, test on the last 20%) before being refit on the full year for
+serving. Current honest out-of-sample results: linear MAPE ≈ 7.2% / R² ≈ 0.58,
+Bayesian MAPE ≈ 7.3% / R² ≈ 0.57. 
 
-**Model choice**: I implemented both linear regression and Bayesian approaches to cover different use cases. Linear regression (scikit-learn) is fast, interpretable, and a good baseline. The Bayesian model (PyMC) handles uncertainty better. The config file specifies which model type to use.
+**Model choice**: I implemented both linear regression and Bayesian approaches
+to cover different use cases. Linear regression (scikit-learn) is fast,
+interpretable, and a good baseline. The Bayesian model (PyMC) standardizes
+features, uses priors scaled to the data, constrains spend effects to be
+non-negative (HalfNormal priors because spend shouldn't reduce sales), reports
+sampling diagnostics (divergences, R-hat), and provides credible intervals for
+its forecasts. The positivity constraint matters in practice: on this data,
+unconstrained OLS assigns social media a negative ROI while the Bayesian model
+keeps it positive. The config file specifies which model type the API serves.
 
-**Simplifications**: I went with a single adstock decay for all channels and didn't use fancy priors, which is definitely simpler than what you'd see in production MMM systems. In reality, TV probably has way different carryover effects than Google Ads, and if you had a marketing expert they could tell you what to expect from each channel. But since I don't have that domain knowledge, I figured it's better to keep things simple than pretend I know stuff I don't. This approach works well for getting started or when you're exploring data without strong assumptions about how different channels should behave.
+**MMM outputs**: because both models are linear in their features, sales
+decompose additively. `channel_contributions()` attributes sales to channels
+and `channel_roi()` divides by spend; both are computed at training time and
+exposed via `GET /models`.
 
-**Inheritance structure**: Both model types needed identical feature engineering but different training logic. A base class avoided code duplication while keeping model-specific implementations separate. This made it easier to experiment with different models without rewriting the preprocessing.
+**Simplifications**: I went with a single adstock decay for all channels, which is definitely simpler than what you'd see in production MMM systems. In reality, TV probably has way different carryover effects than Google Ads, and if you had a marketing expert they could tell you what to expect from each channel. But since I don't have that domain knowledge, I figured it's better to keep things simple than pretend I know stuff I don't.
+
+**Inheritance structure**: Both model types share feature engineering and the
+contribution/ROI logic through a base class, while training, prediction and
+persistence are model-specific. The base class is also where the no-leakage
+guarantee lives, so it holds for every model type.
 
 ### API Design (`api/`)
 
 **CSV-only approach**: Decided to focus on CSV file uploads since that's how marketing data typically exists. This is more practical than complex JSON structures for real-world usage.
 
-**Service layer separation**: Put business logic in MMMService rather than directly in API endpoints. This came from wanting to keep the API focused on request/response handling while making the core functionality reusable for batch processing or different interfaces.
+**Service layer separation**: Put business logic in MMMService rather than directly in API endpoints. This came from wanting to keep the API focused on request/response handling while making the core functionality reusable for batch processing or different interfaces. Evaluation is stateless (no shared service state is mutated per request), so concurrent requests are safe.
 
-**Pre-trained model loading**: API loads saved models on startup instead of training, making it production-ready. The service handles all model loading complexity internally.
+**Pre-trained model loading**: API loads saved models on startup instead of training. If loading fails, `/health` reports `degraded` and `/predictions` returns 503.
 
 
 
 ## Future Improvements
 
 **Models & Analysis**
-- seasonality and external factors (holidays, weather, economic indicators)
-- scenario planning features
-- add ROI simulations for budget optimization
+- external factors (holidays, weather, economic indicators); annual seasonality is already modeled
+- per-channel adstock decay estimated from data instead of a shared config value
+- saturation curves (e.g. Hill) instead of plain log for diminishing returns
+- scenario planning and budget optimization on top of the ROI estimates
 - Include business-specific priors when domain experts are available
+- more than one year of data, so a trend term becomes identifiable
 
 **Technical Infrastructure**
 - Containerize with Docker for easier deployment

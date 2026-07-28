@@ -1,5 +1,5 @@
-from pydantic import BaseModel, field_validator, ConfigDict
-from typing import Dict
+from pydantic import BaseModel, field_validator, ConfigDict, model_validator
+from typing import Dict, Optional
 import pandas as pd
 
 class SpendDataValidator(BaseModel):
@@ -49,36 +49,38 @@ class SalesDataValidator(BaseModel):
 class MergedDataValidator(BaseModel):
     date: pd.Series
     spend_columns: Dict[str, pd.Series]
-    sales: pd.Series
-    
+    #sales is optional: prediction-only data has no sales column
+    sales: Optional[pd.Series] = None
+    #training needs enough history; prediction can be any length
+    min_days: int = 30
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    @field_validator('date')
-    def validate_date_range(cls, v):
-        #need sufficient data for time series modeling
-        if len(v) < 30:
-            raise ValueError(f"Need at least 30 days of data")
-        return v
-    
+
+    @model_validator(mode='after')
+    def validate_date_range(self):
+        if len(self.date) < self.min_days:
+            raise ValueError(f"Need at least {self.min_days} days of data")
+        return self
+
     @field_validator('spend_columns')
     def validate_spend_channels(cls, v):
         #need multiple channels for MMM
         if len(v) < 2:
             raise ValueError(f"Need at least 2 spend channels")
         return v
-    
+
     @field_validator('sales')
     @classmethod
     def validate_sales(cls, v):
-        if not pd.api.types.is_numeric_dtype(v):
+        if v is not None and not pd.api.types.is_numeric_dtype(v):
             raise ValueError("Sales must be numeric")
         return v
 
 class CleanedDataValidator(BaseModel):
     date: pd.Series
     spend_columns: Dict[str, pd.Series]
-    sales: pd.Series
-    
+    sales: Optional[pd.Series] = None
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     @field_validator('spend_columns')
@@ -95,6 +97,8 @@ class CleanedDataValidator(BaseModel):
     @field_validator('sales')
     @classmethod
     def validate_cleaned_sales(cls, v):
+        if v is None:
+            return v
         if (v < 0).any():
             raise ValueError("Sales still has negative values")
         if v.isnull().any():

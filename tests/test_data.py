@@ -33,6 +33,55 @@ class TestDataIngestor:
         assert result is not None
         assert ingestor.cleaned_df is not None
         assert len(ingestor.cleaned_df) > 0
+        # training run must fit and expose cleaning thresholds for serving
+        assert ingestor.cleaning_thresholds
+        assert 'sales' in ingestor.cleaning_thresholds
+
+    def test_prediction_mode_without_sales(self, sample_spend_files):
+        # prediction uploads have no sales file and can be short
+        ingestor = DataIngestor(data_dir=sample_spend_files)
+        result = ingestor.run(training=False)
+        assert 'sales' not in result.columns
+        assert len(result) == 10
+
+    def test_training_mode_requires_sales(self, sample_spend_files):
+        ingestor = DataIngestor(data_dir=sample_spend_files)
+        with pytest.raises(FileNotFoundError, match="Sales file not found"):
+            ingestor.run(training=True)
+
+    def test_prediction_mode_reuses_thresholds(self, sample_spend_files):
+        # a value below the training threshold must survive serving-time
+        # cleaning even if it is extreme relative to the uploaded window
+        thresholds = {'tv_spend': 10_000_000, 'radio_spend': 10_000_000}
+        ingestor = DataIngestor(data_dir=sample_spend_files)
+        result = ingestor.run(training=False, cleaning_thresholds=thresholds)
+        assert ingestor.cleaning_thresholds == thresholds
+        assert result[['tv_spend', 'radio_spend']].notna().all().all()
+
+    def test_leading_outlier_gets_filled(self, tmp_path):
+        # a flagged first row used to stay NaN and crash validation
+        raw_dir = tmp_path / "raw"
+        raw_dir.mkdir()
+        n = 35
+        tv = pd.DataFrame({
+            'date': pd.date_range('2023-01-01', periods=n),
+            'spend': [-50.0] + [100.0] * (n - 1),  # negative on day one
+        })
+        tv.to_csv(raw_dir / "tv_spend.csv", index=False)
+        radio = pd.DataFrame({
+            'date': pd.date_range('2023-01-01', periods=n),
+            'spend': [200.0] * n,
+        })
+        radio.to_csv(raw_dir / "radio_spend.csv", index=False)
+        sales = pd.DataFrame({
+            'date': pd.date_range('2023-01-01', periods=n),
+            'sales': [1000.0] * n,
+        })
+        sales.to_csv(raw_dir / "sales_data.csv", index=False)
+
+        result = DataIngestor(data_dir=raw_dir).run()
+        assert result['tv_spend'].notna().all()
+        assert result['tv_spend'].iloc[0] == 100.0
 
 class TestValidators:
     def test_spend_validator_valid(self):
