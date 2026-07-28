@@ -1,4 +1,5 @@
 import pickle
+import numpy as np
 from sklearn.linear_model import LinearRegression
 from .base_model import BaseMMMModel
 
@@ -13,12 +14,13 @@ class LinearMMMModel(BaseMMMModel):
         X = self.build_features(df, spend_cols)
         y = df[sales_col]
 
-        self.model.fit(X, y)
+        with np.errstate(all='ignore'):
+            self.model.fit(X, y)
+            r2 = self.model.score(X, y)
         self.feature_cols = list(X.columns)
         self.spend_cols = list(spend_cols)
         self.is_trained = True
 
-        r2 = self.model.score(X, y)
         print(f"In-sample R² = {r2:.3f} (see holdout metrics for real performance)")
 
     def predict(self, data):
@@ -27,7 +29,11 @@ class LinearMMMModel(BaseMMMModel):
 
         # use the channels the model was trained on so coefficients stay aligned
         X_new = self.build_features(data, self.spend_cols)[self.feature_cols]
-        return self.model.predict(X_new)
+        with np.errstate(all='ignore'):  # see comment in train()
+            predictions = self.model.predict(X_new)
+        if not np.isfinite(predictions).all():
+            raise FloatingPointError("Linear model produced non-finite predictions")
+        return predictions
 
     def raw_coefficients(self):
         return float(self.model.intercept_), self.model.coef_

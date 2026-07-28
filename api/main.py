@@ -14,8 +14,9 @@ from services.mmm_service import MMMService
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"Loading pre-trained {config.default_model_type} model with adstock_decay={config.adstock_decay:.3f}")
-    mmm_service.load_pretrained()
+    print(f"Loading pre-trained {config.default_model_type} model...")
+    if mmm_service.load_pretrained():
+        print(f"Serving with adstock_decay={mmm_service.model.adstock_decay:.3f} (tuned at training time)")
     yield
 
 
@@ -115,6 +116,7 @@ def get_model_info():
     }
     if mmm_service.training_summary:
         summary = mmm_service.training_summary
+        info["validation"] = summary.get("validation")
         info["holdout_metrics"] = summary.get("holdout")
         info["channel_contributions"] = summary.get("channel_contributions")
         info["channel_roi"] = summary.get("channel_roi")

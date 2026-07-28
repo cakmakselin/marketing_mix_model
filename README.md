@@ -120,21 +120,27 @@ Upload files like:
 ```json
 {
   "forecast": [
-    {"date": "2022-01-01", "predicted_sales": 206831.9, "lower_90": 203222.1, "upper_90": 210851.3}
+    {"date": "2022-01-01", "predicted_sales": 229704.7, "lower_90": 225273.0, "upper_90": 234308.2}
   ],
   "model_type": "bayesian",
-  "adstock_decay": 0.3,
+  "adstock_decay": 0.0,
   "rows_processed": 365,
-  "evaluation": {"mape": 7.1, "r2": 0.78}
+  "evaluation": {"mape": 5.5, "r2": 0.86}
 }
 ```
 `lower_90`/`upper_90` credible intervals are included when the Bayesian model is serving with its trace loaded.
+
+Note on evaluation: the served model is refit on all available data, so if you
+re-upload the training period itself the evaluation is in-sample and will look
+better than the honest out-of-sample numbers on `GET /models`. The evaluation
+becomes a true out-of-sample check when you upload *new* periods as their
+actuals arrive (drift monitoring).
 
 ### Available Endpoints
 
 - `GET /health` - Service health check (`degraded` if no model could be loaded)
 - `POST /predictions` - Upload CSV files for batch predictions (503 if no model loaded)
-- `GET /models` - Model info plus training results: holdout metrics, channel contributions, ROI
+- `GET /models` - Model info plus training results: validation (CV) results, test metrics, channel contributions, ROI
 
 ## Technical Approach & Design Decisions
 
@@ -181,7 +187,10 @@ After implementing preprocessing rules, meaningful patterns emerged. TV spend sh
 **Feature engineering decisions**: Each channel gets exactly one feature:
 `log1p(adstock(spend))`. Adstock models the decaying carryover of marketing
 effects (spend channels show bursts with ~50-90% zero-spend days), and the log
-captures diminishing returns. Features are *only* derived from spend columns so the target (sales) can't leak. On top of
+captures diminishing returns. The decay rate is not assumed, it is tuned by
+time series cross-validation (see Evaluation below). On this dataset the tuned
+decay is 0.0, i.e. sales respond same-day and carry no measurable adstock
+effect; the previously hardcoded 0.3 was actively hurting accuracy. Features are *only* derived from spend columns so the target (sales) can't leak. On top of
 the spend features there's a seasonal baseline (annual sin/cos wave) so channel
 coefficients don't absorb seasonality; monthly sales swing between ~134k and
 ~226k in this data, and without a baseline that variation gets wrongly
@@ -189,10 +198,21 @@ attributed to spend. A separate trend term was deliberately left out: with a
 single year of data, trend and annual seasonality are not separately
 identifiable (tested and a trend term destroyed out-of-sample accuracy).
 
-**Evaluation**: models are evaluated on a temporal holdout (train on the first
-80% of days, test on the last 20%) before being refit on the full year for
-serving. Current honest out-of-sample results: linear MAPE ≈ 7.2% / R² ≈ 0.58,
-Bayesian MAPE ≈ 7.3% / R² ≈ 0.57. 
+**Evaluation** (train/validation/test): the year is split temporally.
+
+1. *Validation*: expanding-window cross-validation (3 folds, `TimeSeriesSplit`)
+   on the first 80% of days. All choices (currently the adstock decay grid
+   search) are made here, so no decision ever touches the test window.
+2. *Test*: the untouched last 20% of days, evaluated exactly once per model.
+   Current results: linear MAPE ≈ 6.1% / R² ≈ 0.72, Bayesian MAPE ≈ 6.1% /
+   R² ≈ 0.72.
+3. *Serving*: both models are refit on the full year with the tuned decay, so
+   the production model doesn't ignore the most recent months.
+
+The CV also showed why tuning matters: validation MAPE rises monotonically
+with decay (6.2% at 0.0 up to ~19% at 0.5), and the channel ROI estimates
+shift substantially with the decay assumption. With one year of data these
+estimates still carry wide error bars; more history is the real cure.
 
 **Model choice**: I implemented both linear regression and Bayesian approaches
 to cover different use cases. Linear regression (scikit-learn) is fast,
@@ -204,12 +224,25 @@ its forecasts. The positivity constraint matters in practice: on this data,
 unconstrained OLS assigns social media a negative ROI while the Bayesian model
 keeps it positive. The config file specifies which model type the API serves.
 
+The two models score identically on the test set (MAPE 6.1%, R² 0.72; their
+predictions correlate at 0.9997). This is expected, not a coincidence: both
+are linear regression on the same 8 features, and with 365 observations the
+data overwhelms the priors, so the Bayesian posterior mean converges to the
+OLS solution. They only disagree on the weakly identified channels (search,
+social media), where OLS lets noise pick small or negative coefficients while
+the positivity prior shrinks them to small-but-positive. Those coefficients
+are tiny either way, so forecasts don't change but the attribution does: same
+accuracy, different budget story. The Bayesian model's value here is the ROI
+signs, credible intervals and diagnostics, not accuracy. Accuracy gains would
+have to come from model structure (per-channel decay, saturation curves,
+holiday effects), not from the inference method.
+
 **MMM outputs**: because both models are linear in their features, sales
 decompose additively. `channel_contributions()` attributes sales to channels
 and `channel_roi()` divides by spend; both are computed at training time and
 exposed via `GET /models`.
 
-**Simplifications**: I went with a single adstock decay for all channels, which is definitely simpler than what you'd see in production MMM systems. In reality, TV probably has way different carryover effects than Google Ads, and if you had a marketing expert they could tell you what to expect from each channel. But since I don't have that domain knowledge, I figured it's better to keep things simple than pretend I know stuff I don't.
+**Simplifications**: all channels share a single adstock decay (tuned from the data by CV, but still shared), which is simpler than production MMM systems. In reality, TV probably has way different carryover effects than Google Ads, and if you had a marketing expert they could tell you what to expect from each channel. Per-channel decay would mean a 6-dimensional search; with one year of data the shared, validated value is the honest middle ground.
 
 **Inheritance structure**: Both model types share feature engineering and the
 contribution/ROI logic through a base class, while training, prediction and
@@ -230,7 +263,7 @@ guarantee lives, so it holds for every model type.
 
 **Models & Analysis**
 - external factors (holidays, weather, economic indicators); annual seasonality is already modeled
-- per-channel adstock decay estimated from data instead of a shared config value
+- per-channel adstock decay (a shared decay is already tuned via time series CV)
 - saturation curves (e.g. Hill) instead of plain log for diminishing returns
 - scenario planning and budget optimization on top of the ROI estimates
 - Include business-specific priors when domain experts are available

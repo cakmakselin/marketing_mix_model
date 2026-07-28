@@ -18,7 +18,8 @@ class MMMConfig:
     sales_file_name = "sales_data"
 
     default_model_type = "bayesian"
-    adstock_decay = 0.3
+    
+    adstock_decay = 0.3 #fallback only
 
 
 config = MMMConfig() 

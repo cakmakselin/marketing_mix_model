@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -131,10 +132,11 @@ class BayesianMMMModel(BaseMMMModel):
         return np.percentile(preds, [lo, 100 - lo], axis=1)
 
     def save(self, trace_path):
-        #trace (netcdf) for uncertainty + json sidecar with everything
-        #needed to rebuild features and predict
+        trace_path = Path(trace_path)
         if self.trace is not None:
-            self.trace.to_netcdf(str(trace_path))
+            tmp_path = trace_path.with_suffix('.nc.tmp')
+            self.trace.to_netcdf(str(tmp_path))
+            os.replace(tmp_path, trace_path)
         meta = {
             "adstock_decay": self.adstock_decay,
             "feature_cols": self.feature_cols,
@@ -144,8 +146,11 @@ class BayesianMMMModel(BaseMMMModel):
             "alpha_mean": self.alpha_mean,
             "betas_mean": np.asarray(self.betas_mean).tolist(),
         }
-        with open(self._meta_path(trace_path), 'w') as f:
+        meta_path = self._meta_path(trace_path)
+        tmp_meta = meta_path.with_suffix('.json.tmp')
+        with open(tmp_meta, 'w') as f:
             json.dump(meta, f, indent=2)
+        os.replace(tmp_meta, meta_path)
 
     def load(self, trace_path):
         meta_path = self._meta_path(trace_path)
@@ -165,12 +170,13 @@ class BayesianMMMModel(BaseMMMModel):
         self.betas_mean = np.array(meta["betas_mean"])
         self.is_trained = True
 
-        #trace is optional: predictions work from posterior means alone,
-        #the trace only adds credible intervals
+        #trace is optional: predictions work from posterior means alone
         trace_path = Path(trace_path)
         if trace_path.exists():
             az = _import_arviz()
             self.trace = az.from_netcdf(str(trace_path))
+            self.trace.load()
+            self.trace.close()
         else:
             self.trace = None
         return True
